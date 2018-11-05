@@ -7,10 +7,13 @@
 
 package com.facebook.react.modules.storage;
 
+import java.util.ArrayDeque;
 import java.util.HashSet;
+import java.util.concurrent.Executor;
 
 import android.database.Cursor;
 import android.database.sqlite.SQLiteStatement;
+import android.os.AsyncTask;
 
 import com.facebook.common.logging.FLog;
 import com.facebook.react.bridge.Arguments;
@@ -23,6 +26,7 @@ import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.common.ReactConstants;
+import com.facebook.react.common.annotations.VisibleForTesting;
 import com.facebook.react.module.annotations.ReactModule;
 import com.facebook.react.modules.common.ModuleDataCleaner;
 
@@ -32,7 +36,7 @@ import static com.facebook.react.modules.storage.ReactDatabaseSupplier.VALUE_COL
 
 @ReactModule(name = AsyncStorageModule.NAME)
 public final class AsyncStorageModule
-    extends ReactContextBaseJavaModule implements ModuleDataCleaner.Cleanable {
+        extends ReactContextBaseJavaModule implements ModuleDataCleaner.Cleanable {
 
   protected static final String NAME = "AsyncSQLiteDBStorage";
 
@@ -43,8 +47,47 @@ public final class AsyncStorageModule
   private ReactDatabaseSupplier mReactDatabaseSupplier;
   private boolean mShuttingDown = false;
 
+  // Adapted from https://android.googlesource.com/platform/frameworks/base.git/+/1488a3a19d4681a41fb45570c15e14d99db1cb66/core/java/android/os/AsyncTask.java#237
+  private class SerialExecutor implements Executor {
+    private final ArrayDeque<Runnable> mTasks = new ArrayDeque<Runnable>();
+    private Runnable mActive;
+    private final Executor executor;
+
+    SerialExecutor(Executor executor) {
+      this.executor = executor;
+    }
+
+    public synchronized void execute(final Runnable r) {
+      mTasks.offer(new Runnable() {
+        public void run() {
+          try {
+            r.run();
+          } finally {
+            scheduleNext();
+          }
+        }
+      });
+      if (mActive == null) {
+        scheduleNext();
+      }
+    }
+    synchronized void scheduleNext() {
+      if ((mActive = mTasks.poll()) != null) {
+        executor.execute(mActive);
+      }
+    }
+  }
+
+  private final SerialExecutor executor;
+
   public AsyncStorageModule(ReactApplicationContext reactContext) {
+    this(reactContext, AsyncTask.THREAD_POOL_EXECUTOR);
+  }
+
+  @VisibleForTesting
+  AsyncStorageModule(ReactApplicationContext reactContext, Executor executor) {
     super(reactContext);
+    this.executor = new SerialExecutor(executor);
     mReactDatabaseSupplier = ReactDatabaseSupplier.getInstance(reactContext);
   }
 
@@ -97,13 +140,13 @@ public final class AsyncStorageModule
         for (int keyStart = 0; keyStart < keys.size(); keyStart += MAX_SQL_KEYS) {
           int keyCount = Math.min(keys.size() - keyStart, MAX_SQL_KEYS);
           Cursor cursor = mReactDatabaseSupplier.get().query(
-              TABLE_CATALYST,
-              columns,
-              AsyncLocalStorageUtil.buildKeySelection(keyCount),
-              AsyncLocalStorageUtil.buildKeySelectionArgs(keys, keyStart, keyCount),
-              null,
-              null,
-              null);
+                  TABLE_CATALYST,
+                  columns,
+                  AsyncLocalStorageUtil.buildKeySelection(keyCount),
+                  AsyncLocalStorageUtil.buildKeySelectionArgs(keys, keyStart, keyCount),
+                  null,
+                  null,
+                  null);
           keysRemaining.clear();
           try {
             if (cursor.getCount() != keys.size()) {
@@ -141,7 +184,7 @@ public final class AsyncStorageModule
 
         callback.invoke(null, data);
       }
-    }.execute();
+    }.executeOnExecutor(executor);
   }
 
   /**
@@ -208,7 +251,7 @@ public final class AsyncStorageModule
           callback.invoke();
         }
       }
-    }.execute();
+    }.executeOnExecutor(executor);
   }
 
   /**
@@ -235,9 +278,9 @@ public final class AsyncStorageModule
           for (int keyStart = 0; keyStart < keys.size(); keyStart += MAX_SQL_KEYS) {
             int keyCount = Math.min(keys.size() - keyStart, MAX_SQL_KEYS);
             mReactDatabaseSupplier.get().delete(
-                TABLE_CATALYST,
-                AsyncLocalStorageUtil.buildKeySelection(keyCount),
-                AsyncLocalStorageUtil.buildKeySelectionArgs(keys, keyStart, keyCount));
+                    TABLE_CATALYST,
+                    AsyncLocalStorageUtil.buildKeySelection(keyCount),
+                    AsyncLocalStorageUtil.buildKeySelectionArgs(keys, keyStart, keyCount));
           }
           mReactDatabaseSupplier.get().setTransactionSuccessful();
         } catch (Exception e) {
@@ -245,7 +288,7 @@ public final class AsyncStorageModule
           error = AsyncStorageErrorUtil.getError(null, e.getMessage());
         } finally {
           try {
-          mReactDatabaseSupplier.get().endTransaction();
+            mReactDatabaseSupplier.get().endTransaction();
           } catch (Exception e) {
             FLog.w(ReactConstants.TAG, e.getMessage(), e);
             if (error == null) {
@@ -259,7 +302,7 @@ public final class AsyncStorageModule
           callback.invoke();
         }
       }
-    }.execute();
+    }.executeOnExecutor(executor);
   }
 
   /**
@@ -295,9 +338,9 @@ public final class AsyncStorageModule
             }
 
             if (!AsyncLocalStorageUtil.mergeImpl(
-                mReactDatabaseSupplier.get(),
-                keyValueArray.getArray(idx).getString(0),
-                keyValueArray.getArray(idx).getString(1))) {
+                    mReactDatabaseSupplier.get(),
+                    keyValueArray.getArray(idx).getString(0),
+                    keyValueArray.getArray(idx).getString(1))) {
               error = AsyncStorageErrorUtil.getDBError(null);
               return;
             }
@@ -322,7 +365,7 @@ public final class AsyncStorageModule
           callback.invoke();
         }
       }
-    }.execute();
+    }.executeOnExecutor(executor);
   }
 
   /**
@@ -345,7 +388,7 @@ public final class AsyncStorageModule
           callback.invoke(AsyncStorageErrorUtil.getError(null, e.getMessage()));
         }
       }
-    }.execute();
+    }.executeOnExecutor(executor);
   }
 
   /**
@@ -363,7 +406,7 @@ public final class AsyncStorageModule
         WritableArray data = Arguments.createArray();
         String[] columns = {KEY_COLUMN};
         Cursor cursor = mReactDatabaseSupplier.get()
-            .query(TABLE_CATALYST, columns, null, null, null, null, null);
+                .query(TABLE_CATALYST, columns, null, null, null, null, null);
         try {
           if (cursor.moveToFirst()) {
             do {
@@ -379,7 +422,7 @@ public final class AsyncStorageModule
         }
         callback.invoke(null, data);
       }
-    }.execute();
+    }.executeOnExecutor(executor);
   }
 
   /**
